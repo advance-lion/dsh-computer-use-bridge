@@ -150,9 +150,25 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 
 - **任务级独占**，不是"每次点击加锁"。否则会出现 A 打开表单、B 切走窗口、A 在别人的窗口里输入。
 - **默认 FIFO**，模型无权插队。
-- **跨进程**：用 OS 级独占句柄（Windows 命名管道）声明控制权，抢不到就拒绝执行，而不是抢鼠标。
+- **跨进程**：用 OS 级独占句柄（Windows 命名管道，macOS/Linux Unix domain socket）声明本次任务的
+  控制权；只在 `computer_task` 运行期间持有，任务结束即释放。
 - **与悬浮球互斥**：桥接工作时悬浮球会话让位，反之亦然。
 - **随停止中断**：你在聊天里点停止，桌面工作会话一并中断。
+
+### 锁的粒度
+
+Windows 和 macOS 使用同一个任务级语义：插件空闲时不占锁；拿到 FIFO 名额后申请跨进程
+Computer Use 租约；worker 结束、取消或启动失败后释放，随后才允许下一个任务开始。
+
+| 层级 | Windows | macOS |
+| --- | --- | --- |
+| 进程内任务队列 | FIFO，单 CMU 任务 | FIFO，单 CMU 任务 |
+| 跨进程租约 | 单个 `computer_task` 生命周期 | 单个 `computer_task` 生命周期 |
+| OS 原语 | Windows 命名管道 | Unix domain socket |
+| 崩溃残留 | 命名管道随进程消失 | 先探测 live listener，确认陈旧后清理 |
+| 空闲状态 | 不占用桌面控制权 | 不占用桌面控制权 |
+
+OS handle 属于进程，但 lease 生命周期属于任务，不是插件加载到进程退出的全过程。
 
 ---
 
@@ -176,7 +192,7 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 | 项 | 说明 |
 | --- | --- |
 | DSH | 0.2.x（桌面版实测） |
-| 平台 | Windows 首发，其它平台未验证 |
+| 平台 | Windows 已实测；macOS/Linux 使用 Unix domain socket，macOS 实机仍需验证 |
 | 依赖 | **dsh-orb ≥ 0.2.0**（提供 `computer-use` 预设） |
 | 耦合 | 只依赖预设 id 与 `screen-owner` 记录，**不 import dsh-orb 代码**，升级不会在加载期崩 |
 
@@ -198,7 +214,7 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-34 项测试：调度 FIFO / 超时 / 取消、跨进程控制权、悬浮球对撞（用宿主实际加载的 dsh-orb 代码判定）、显式标记识别、随停止中断、缺依赖降级。
+38 项测试：调度 FIFO / 超时 / 取消、任务级跨进程租约、悬浮球对撞（用宿主实际加载的 dsh-orb 代码判定）、显式标记识别、随停止中断、缺依赖降级。
 
 设计取舍与完整验证记录见 [docs/design-notes.md](docs/design-notes.md)。
 

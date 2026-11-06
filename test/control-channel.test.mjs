@@ -55,7 +55,6 @@ test('control is reclaimable once the other process lets go', async () => {
   assert.equal(refused.owner, false)
   await new Promise((done) => foreign.close(done))
 
-  await releaseDesktopControl()
   const claim = await claimDesktopControl()
   assert.equal(claim.owner, true)
   await claim.dispose()

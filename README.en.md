@@ -150,9 +150,26 @@ submit → queue → acquire lease → desktop worker → release → next
 
 - **Task-level exclusivity**, not per-click locking. Otherwise A opens a form, B switches windows, and A types into the wrong one.
 - **FIFO by default**; the model cannot jump the queue.
-- **Cross-process**: an OS-level exclusive handle (a Windows named pipe) claims control; a second process refuses to act instead of fighting for the mouse.
+- **Cross-process**: an OS-level exclusive handle (a Windows named pipe, or a Unix domain socket on macOS/Linux) is held for one `computer_task` at a time and released when that worker settles.
 - **Mutual exclusion with the floating ball**: whichever side holds the desktop, the other yields.
 - **Stops with you**: stopping the conversation interrupts the desktop worker too.
+
+### Lock granularity
+
+Windows and macOS use the same task-level semantics. An idle plugin holds nothing; after winning
+the FIFO slot it acquires a cross-process Computer Use lease, and releases it after the worker
+settles, is cancelled, or fails to start. Only then may the next task begin.
+
+| Layer | Windows | macOS |
+| --- | --- | --- |
+| In-process task queue | FIFO, one CMU task | FIFO, one CMU task |
+| Cross-process lease | One `computer_task` lifetime | One `computer_task` lifetime |
+| OS primitive | Windows named pipe | Unix domain socket |
+| Crash residue | Vanishes with the process | Probe the listener; remove only a stale socket |
+| Idle state | Does not reserve desktop control | Does not reserve desktop control |
+
+The OS handle belongs to a process, but the lease belongs to one task. It is not held from plugin
+load until process exit.
 
 ---
 
@@ -176,7 +193,7 @@ submit → queue → acquire lease → desktop worker → release → next
 | Item | Note |
 | --- | --- |
 | DSH | 0.2.x (verified on the desktop app) |
-| Platform | Windows first; other platforms unverified |
+| Platform | Windows verified; macOS/Linux use a Unix domain socket, with macOS device verification still required |
 | Requires | **dsh-orb ≥ 0.2.0** (supplies the `computer-use` preset) |
 | Coupling | Only the preset id and the `screen-owner` record; **no dsh-orb code is imported**, so an upgrade cannot break loading |
 
@@ -198,7 +215,7 @@ If the preset is renamed or missing, the plugin says so in a startup self-check 
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-34 tests: FIFO / timeout / cancellation, cross-process control, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, stop-following, and degraded mode without the dependency.
+38 tests: FIFO / timeout / cancellation, task-scoped cross-process leases, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, stop-following, and degraded mode without the dependency.
 
 Design rationale and the full verification record: [docs/design-notes.md](docs/design-notes.md).
 

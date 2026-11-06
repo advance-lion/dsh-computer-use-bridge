@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict'
+import net from 'node:net'
 import test from 'node:test'
 
 // Keep this process's desktop-control channel namespaced: the real Harness may be
 // holding the production one while the suite runs.
 process.env.DSH_DESKTOP_BRIDGE_CHANNEL = `dsh-desktop-bridge.test.${process.pid}`
 const { apply } = await import('../lib/index.js')
+const { desktopControlAddress, releaseDesktopControl } = await import('../lib/control-channel.js')
 
 const SCHEDULER_KEY = Symbol.for('dsh-desktop-bridge.scheduler')
 const OWNER_KEY = Symbol.for('dsh-orb.screen-owner')
+const CONTROL_KEY = Symbol.for('dsh-desktop-bridge.control')
 
 function reset() {
   delete globalThis[SCHEDULER_KEY]
@@ -37,6 +40,7 @@ function makeContext(options = {}) {
     },
     subagents: {
       async startActivation(spec) {
+        if (options.startError) throw options.startError
         const childId = `child-${activations.length + 1}`
         let settle
         const result = new Promise((resolve) => {
@@ -320,4 +324,82 @@ test('the worker keeps the screen owner while it runs and restores it after', as
   activations[0].settle({ stopReason: 'completed', output: [] })
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(globalThis[OWNER_KEY].ownerId, 'ball-session')
+})
+
+test('cross-process control is a task lease, not a plugin-process claim', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const { ctx, tools, activations } = makeContext()
+  const cleanup = apply(ctx, {})
+
+  assert.equal(
+    globalThis[CONTROL_KEY]?.attempt,
+    undefined,
+    'loading the plugin must not reserve the desktop while no task is running',
+  )
+
+  await tools.get('computer_task').execute(taskArgs(), execFor(makeAgent('s1', 'standard')))
+  assert.notEqual(
+    globalThis[CONTROL_KEY]?.attempt,
+    undefined,
+    'the running task must hold cross-process control',
+  )
+
+  activations[0].settle({ stopReason: 'completed', output: [] })
+  for (let attempt = 0; attempt < 20 && globalThis[CONTROL_KEY]?.attempt !== undefined; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(
+    globalThis[CONTROL_KEY]?.attempt,
+    undefined,
+    'settling the worker must release cross-process control for the next process',
+  )
+
+  await cleanup()
+})
+
+test('worker-start failure releases both task queues', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const { ctx, tools } = makeContext({ startError: new Error('worker failed') })
+  const cleanup = apply(ctx, {})
+
+  await assert.rejects(
+    tools.get('computer_task').execute(taskArgs(), execFor(makeAgent('s1', 'standard'))),
+    /Could not start the desktop worker: worker failed/,
+  )
+  const status = await tools.get('computer_desktop_status').execute({}, execFor(makeAgent('s1', 'standard')))
+  assert.equal(status.busy, false)
+  assert.equal(status.waiting, 0)
+  assert.equal(globalThis[CONTROL_KEY]?.attempt, undefined)
+
+  await cleanup()
+})
+
+test('a foreign process conflict is detected per task and does not leave the local queue held', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const foreign = await new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.once('error', reject)
+    server.listen(desktopControlAddress(), () => resolve(server))
+  })
+  const { ctx, tools } = makeContext()
+  const cleanup = apply(ctx, {})
+
+  try {
+    await assert.rejects(
+      tools.get('computer_task').execute(taskArgs(), execFor(makeAgent('s1', 'standard'))),
+      /Another DeepSeek Harness process/,
+    )
+    const status = await tools.get('computer_desktop_status').execute({}, execFor(makeAgent('s1', 'standard')))
+    assert.equal(status.busy, false)
+    assert.equal(status.waiting, 0)
+  } finally {
+    await new Promise((done) => foreign.close(done))
+    await cleanup()
+  }
 })
