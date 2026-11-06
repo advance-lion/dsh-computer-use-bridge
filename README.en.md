@@ -4,14 +4,14 @@
 
 # Desktop Fallback Bridge
 
-**Give DSH the same Computer Use you get from Codex.**
+**Give DSH the same Computer Use you get from Codex, on Windows and macOS.**
 
 See the screen · Click · Type · Across apps — from one conversation entry point
 
 [中文](README.md) | **English**
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Platform](https://img.shields.io/badge/platform-Windows-0078d4)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-0078d4)
 ![Execution](https://img.shields.io/badge/execution-dsh--orb-6b46c1)
 ![Tools](https://img.shields.io/badge/GUI%20tools-13-2f9e44)
 
@@ -49,7 +49,7 @@ your session ──computer_task──▶ desktop worker ──▶ screenshot / 
 | One executor on the desktop | platform-level | ✅ task lease + cross-process claim |
 | Stops when you stop | ✅ | ✅ stopping the turn interrupts the worker |
 | Per-task budget cap | ✅ | ✅ time-and-queue limits, configurable |
-| Independent cursor, background operation | macOS only | ❌ Windows is foreground-only (see Boundaries) |
+| Independent cursor, background operation | macOS only | ⚠️ macOS background capability depends on dsh-orb; Windows is foreground-only |
 | Per-action human confirmation | ✅ | ⚠️ partial: budget and stop, no per-click prompt yet |
 
 > In short: **the execution surface is on par with Codex; the scheduling and safety model is rebuilt for how DSH actually runs.**
@@ -139,6 +139,8 @@ The criterion is borrowed from Codex: **when a task depends on a graphical inter
 - **Not cross-machine.** It drives the host desktop, not the device your browser runs on.
 - **Not everything is automatable.** Terminal apps, DSH itself, and admin-authorised system dialogs are out of scope.
 - **Windows is foreground-only.** It really takes over pointer and keyboard; the independent cursor and background operation Codex has on macOS are not available here.
+- **macOS requires system permissions.** Screen Recording lets dsh-orb see windows, and Accessibility lets it click
+  and type. Grant them to the DeepSeek Harness app or the terminal process hosting dsh-orb.
 
 ---
 
@@ -193,7 +195,7 @@ load until process exit.
 | Item | Note |
 | --- | --- |
 | DSH | 0.2.x (verified on the desktop app) |
-| Platform | Windows verified; macOS/Linux use a Unix domain socket, with macOS device verification still required |
+| Platform | Windows / macOS; dsh-orb supplies screen and input, while macOS uses a Unix domain socket task lease |
 | Requires | **dsh-orb ≥ 0.2.0** (supplies the `computer-use` preset) |
 | Coupling | Only the preset id and the `screen-owner` record; **no dsh-orb code is imported**, so an upgrade cannot break loading |
 

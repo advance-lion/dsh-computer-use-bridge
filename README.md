@@ -4,14 +4,14 @@
 
 # 桌面兜底桥
 
-**给 DSH 装上 Codex 级的 Computer Use。**
+**给 DSH 装上 Codex 级的 Computer Use，支持 Windows 与 macOS。**
 
 看见屏幕 · 点击 · 输入 · 跨应用 —— 为所有对话提供最终的GUI手段
 
 **中文** | [English](README.en.md)
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Platform](https://img.shields.io/badge/platform-Windows-0078d4)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-0078d4)
 ![Execution](https://img.shields.io/badge/execution-dsh--orb-6b46c1)
 ![Tools](https://img.shields.io/badge/GUI%20tools-13-2f9e44)
 
@@ -49,7 +49,7 @@ DSH 会写代码、会跑命令，但它**看不见屏幕上正在发生什么**
 | 桌面同一时刻一个执行者 | 平台级 | ✅ 任务租约 + 跨进程独占 |
 | 随「停止」一起停 | ✅ | ✅ 停掉对话即中断工作会话 |
 | 单任务预算上限 | ✅ | ✅ 步数 / 时长可配 |
-| 独立光标、后台操作 | macOS 专属 | ❌ Windows 前台独占（见边界） |
+| 独立光标、后台操作 | macOS 专属 | ⚠️ macOS 后台能力取决于 dsh-orb；Windows 前台独占 |
 | 逐动作人工确认 | ✅ | ⚠️ 部分：敏感动作靠预算与停止，逐动作弹窗未做 |
 
 > 换句话说：**执行能力和 Codex 是同一档，调度和安全模型按 DSH 的实际情况重做过。**
@@ -139,6 +139,8 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 - **不跨机器。** 控制的是宿主桌面，不是浏览器所在设备。
 - **不装作能自动化一切。** 终端类应用、DSH 自身、需要管理员授权的系统弹窗不在范围内。
 - **Windows 只有前台。** 它会真的接管指针和键盘（Codex 在 macOS 上的独立光标、后台操作这里没有）。
+- **macOS 需要系统权限。** Screen Recording 用于看见窗口，Accessibility 用于点击和输入；
+  授权对象是承载 dsh-orb 的 DeepSeek Harness 或终端进程。
 
 ---
 
@@ -192,7 +194,7 @@ OS handle 属于进程，但 lease 生命周期属于任务，不是插件加载
 | 项 | 说明 |
 | --- | --- |
 | DSH | 0.2.x（桌面版实测） |
-| 平台 | Windows 已实测；macOS/Linux 使用 Unix domain socket，macOS 实机仍需验证 |
+| 平台 | Windows / macOS；屏幕与输入由 dsh-orb 提供，macOS 使用 Unix domain socket 任务租约 |
 | 依赖 | **dsh-orb ≥ 0.2.0**（提供 `computer-use` 预设） |
 | 耦合 | 只依赖预设 id 与 `screen-owner` 记录，**不 import dsh-orb 代码**，升级不会在加载期崩 |
 
