@@ -47,7 +47,7 @@ your session ──computer_task──▶ desktop worker ──▶ screenshot / 
 | Explicit `@Computer` invocation | ✅ | ✅ `@computer` / `@desktop` |
 | Structured integrations first (plugin / MCP) | ✅ | ✅ built into the tool criteria |
 | One executor on the desktop | platform-level | ✅ task lease + cross-process claim |
-| Stops when you stop | ✅ | ✅ pauses the worker for continuation |
+| Stops when you stop | ✅ | ✅ Escape pauses the worker for continuation |
 | Per-task budget cap | ✅ | ✅ time-and-queue limits, configurable |
 | Independent cursor, background operation | macOS background; Windows foreground-only | macOS (dsh-orb background); Windows (dsh-orb foreground-only) |
 | Per-action human confirmation | ✅ | ⚠️ partial: budget and stop, no per-click prompt yet |
@@ -113,17 +113,17 @@ The still frame below is the verified end state:
 
 ## Pause and continue
 
-Desktop tasks have three distinct lifecycle controls:
+The user has one pause control: press **Escape** while desktop work is running. The bridge cancels the active
+worker turn and releases the desktop lease while keeping the same GUI worker session. The user does not choose
+between pause and cancel, manage task ids, or operate a separate resume control.
 
-- `computer_task_pause` cancels the active worker turn and releases the desktop lease while keeping the
-  same GUI worker session.
-- `computer_task_resume` acquires the desktop FIFO slot again and sends a continuation prompt into that
-  same session.
-- `computer_task_cancel` abandons the task without keeping a resumable task record.
+If the user later says “continue”, the model calls the internal `computer_task_resume` tool. It acquires the
+desktop FIFO slot again and sends a continuation prompt into the same worker session. `computer_task_cancel`
+is only for the user explicitly saying they no longer want the task.
 
 | Outcome | Action | Resumable |
 | --- | --- | --- |
-| User pause / parent-turn stop | Pause and release the desktop | Yes |
+| User presses Escape / parent-turn stop | Pause and release the desktop | Yes, by saying “continue” |
 | `maxRunSeconds` reached | Pause and release the desktop | Yes |
 | Worker ends with `error`, `max-tokens`, `refusal`, or another non-complete reason | Pause for human review | Yes |
 | Worker completes normally | Finish and deliver the completion notice | No |
@@ -132,6 +132,9 @@ Desktop tasks have three distinct lifecycle controls:
 
 Resume always re-enters the queue because pausing releases the desktop lease. It starts immediately when the
 desktop is free and otherwise waits in FIFO order; it keeps no priority from before the pause.
+
+So Escape can interrupt it, the Session worker path keeps the current parent turn active while `computer_task`
+runs. The tool returns only after completion or pause; users never need to understand pause/cancel tooling.
 
 Work the worker already observed and completed stays in that session history. If a pause happens during a
 GUI action, resume re-observes the current screen before continuing instead of blindly replaying successful

@@ -47,7 +47,7 @@ DSH 会写代码、会跑命令，但它**看不见屏幕上正在发生什么**
 | 显式调用 `@Computer` | ✅ | ✅ `@computer` / `@desktop` / `@电脑` |
 | 结构化优先（插件 / MCP 先行） | ✅ | ✅ 写进工具判据 |
 | 桌面同一时刻一个执行者 | 平台级 | ✅ 任务租约 + 跨进程独占 |
-| 随「停止」一起停 | ✅ | ✅ 暂停工作会话，可继续 |
+| 随「停止」一起停 | ✅ | ✅ 按 Esc 暂停工作会话，可继续 |
 | 单任务预算上限 | ✅ | ✅ 步数 / 时长可配 |
 | 独立光标、后台操作 | macOS 后台操作；Windows 前台独占 | macOS（dsh-orb 后台操作）；Windows（dsh-orb 前台独占） |
 | 逐动作人工确认 | ✅ | ⚠️ 部分：敏感动作靠预算与停止，逐动作弹窗未做 |
@@ -113,15 +113,15 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 
 ## 手动停止与继续
 
-桌面任务提供三条不同的生命周期路径：
+用户只负责暂停：运行桌面任务时按 **Esc**。bridge 会取消当前 worker turn 并释放桌面租约，但保留同一个
+GUI session。用户不需要选择“暂停还是取消”，也不需要管理 task id 或恢复按钮。
 
-- `computer_task_pause`：暂停当前 worker，取消正在执行的 turn 并释放桌面租约，但保留同一个 GUI session。
-- `computer_task_resume`：重新申请桌面 FIFO 名额，然后向同一个 worker session 发送继续指令。
-- `computer_task_cancel`：彻底放弃任务，不保留可继续的任务记录。
+之后用户说“继续”时，模型会调用内部工具 `computer_task_resume`：重新申请桌面 FIFO 名额，然后向同一个
+worker session 发送继续指令。`computer_task_cancel` 只用于用户明确表示“不再继续这个任务”时清理记录。
 
 | 结果 | 处理 | 能否恢复 |
 | --- | --- | --- |
-| 用户主动暂停 / 停止父 turn | 暂停，释放桌面 | 是 |
+| 用户按 Esc / 停止父 turn | 暂停，释放桌面 | 是，用户说“继续”即可 |
 | 达到 `maxRunSeconds` | 暂停，释放桌面 | 是 |
 | worker 返回 `error` / `max-tokens` / `refusal` 等非完成原因 | 暂停等待人工判断 | 是 |
 | worker 正常完成 | 结束并发送完成通知 | 否 |
@@ -130,6 +130,9 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 
 恢复时任务必须重新排队：暂停会释放桌面，不能假定离开期间没有其他任务获得租约。桌面空闲时立即获得；
 忙碌时进入 FIFO，不保留暂停前的插队特权。
+
+为了让 Esc 可中断，Session worker 路径会让 `computer_task` 在 worker 运行期间保持当前父 turn 活跃；
+完成或暂停后工具才返回。于是用户无需理解 pause/cancel 工具，也不需要另行点击恢复。
 
 worker 已经看过、已经完成的步骤仍在同一个 session 历史里。暂停发生在 GUI 动作过程中时，恢复会先重新观察
 当前屏幕，再继续未完成部分，不会盲目重放已经成功的动作。

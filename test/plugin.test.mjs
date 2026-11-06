@@ -156,7 +156,6 @@ test('registers the task lifecycle tools', () => {
     'computer_desktop_status',
     'computer_task',
     'computer_task_cancel',
-    'computer_task_pause',
     'computer_task_resume',
   ])
   cleanup()
@@ -452,93 +451,95 @@ test('a foreign process conflict is detected per task and does not leave the loc
   }
 })
 
-test('pause keeps the worker session and resume continues it from the same context', async () => {
+test('Escape pauses the active parent turn and resume continues the same worker session', async () => {
   reset()
   await releaseDesktopControl()
 
   const parent = makeAgent('s1', 'standard')
-  const {
-    ctx,
-    tools,
-    handlers,
-    sessions,
-    prompts,
-    cancels,
-  } = makeContext({ sessionWorker: true })
+  const { ctx, tools, handlers, sessions, prompts, cancels } = makeContext({ sessionWorker: true })
   const cleanup = apply(ctx, {})
 
-  const started = await tools.get('computer_task').execute(taskArgs(), execFor(parent))
-  assert.equal(sessions.get(started.childId).agentPreset, 'computer-use')
+  const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
+  for (let attempt = 0; attempt < 20 && prompts.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
   assert.equal(prompts.length, 1)
-
-  const paused = await tools
-    .get('computer_task_pause')
-    .execute({ task_id: started.taskId }, execFor(parent))
-  assert.equal(paused.result, 'pausing')
-  assert.deepEqual(cancels, [{ sessionId: started.childId }])
-
-  handlers.get('session/event')(
-    { header: { id: started.childId } },
-    { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
-  )
-  for (let attempt = 0; attempt < 20 && globalThis[CONTROL_KEY]?.attempt !== undefined; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
-  assert.equal(globalThis[CONTROL_KEY]?.attempt, undefined)
-
-  const resumed = await tools.get('computer_task_resume').execute(
-    { task_id: started.taskId, instruction: 'Finish the export dialog.' },
-    execFor(parent),
-  )
-  assert.equal(resumed.status, 'resumed')
-  assert.equal(resumed.childId, started.childId)
-  assert.equal(prompts.length, 2)
-  assert.equal(prompts[1].sessionId, prompts[0].sessionId)
-  assert.match(prompts[1].content[0].text, /Resume the same desktop task/)
-  assert.match(prompts[1].content[0].text, /Finish the export dialog/)
-
-  handlers.get('session/event')(
-    { header: { id: started.childId } },
-    { type: 'turn/end', data: { reason: { kind: 'completed' } } },
-  )
-  for (let attempt = 0; attempt < 20 && parent.notices.length === 0; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
-  assert.equal(parent.notices.length, 1)
-  assert.equal(parent.notices[0].source.kind, 'subagent-settled')
-
-  await cleanup()
-})
-
-test('stopping the calling turn pauses a resumable session worker', async () => {
-  reset()
-  await releaseDesktopControl()
-
-  const parent = makeAgent('s1', 'standard')
-  const { ctx, tools, handlers, sessions, cancels } = makeContext({ sessionWorker: true })
-  const cleanup = apply(ctx, {})
-  const started = await tools.get('computer_task').execute(taskArgs(), execFor(parent))
+  const childId = prompts[0].sessionId
+  assert.equal(sessions.get(childId).agentPreset, 'computer-use')
 
   handlers.get('session/event')(
     { header: { id: 's1' } },
     { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
   )
-  assert.deepEqual(cancels, [{ sessionId: started.childId }])
+  assert.deepEqual(cancels, [{ sessionId: childId }])
 
   handlers.get('session/event')(
-    { header: { id: started.childId } },
+    { header: { id: childId } },
     { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
   )
-  await new Promise((resolve) => setImmediate(resolve))
+  const paused = await running
+  assert.equal(paused.status, 'paused')
+  assert.equal(paused.childId, childId)
+  for (let attempt = 0; attempt < 20 && globalThis[CONTROL_KEY]?.attempt !== undefined; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(globalThis[CONTROL_KEY]?.attempt, undefined)
 
-  const resumed = await tools.get('computer_task_resume').execute(
-    { task_id: started.taskId },
+  const resumedRun = tools.get('computer_task_resume').execute(
+    { task_id: paused.taskId, instruction: 'Finish the export dialog.' },
     execFor(parent),
   )
-  assert.equal(resumed.status, 'resumed')
-  assert.equal(sessions.has(started.childId), true)
+  for (let attempt = 0; attempt < 20 && prompts.length < 2; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(prompts.length, 2, 'resume must start a new turn in the same session')
+  assert.equal(prompts[1].sessionId, prompts[0].sessionId)
+  assert.match(prompts[1].content[0].text, /Resume the same desktop task/)
+  assert.match(prompts[1].content[0].text, /Finish the export dialog/)
 
-  await tools.get('computer_task_cancel').execute({ task_id: started.taskId }, execFor(parent))
+  handlers.get('session/event')(
+    { header: { id: childId } },
+    { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+  )
+  const resumed = await resumedRun
+  assert.equal(resumed.status, 'completed')
+  assert.equal(resumed.childId, childId)
+  assert.equal(resumed.result, 'desktop task result')
+
+  await cleanup()
+})
+
+test('Escape records a paused task for the next parent turn', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const parent = makeAgent('s1', 'standard')
+  const { ctx, tools, handlers, sections, sessions, cancels, prompts } = makeContext({ sessionWorker: true })
+  const cleanup = apply(ctx, {})
+  const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
+  for (let attempt = 0; attempt < 20 && prompts.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+
+  handlers.get('session/event')(
+    { header: { id: 's1' } },
+    { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
+  )
+  const childId = cancels[0].sessionId
+  assert.equal(typeof childId, 'string')
+
+  handlers.get('session/event')(
+    { header: { id: childId } },
+    { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
+  )
+  const paused = await running
+  assert.equal(paused.status, 'paused')
+  assert.equal(sessions.has(paused.childId), true)
+  const prompt = sections.get('desktop-bridge-paused').text({ agent: parent })
+  assert.match(prompt, new RegExp(paused.taskId))
+  assert.match(prompt, /user pauses desktop work with Escape/)
+
+  await tools.get('computer_task_cancel').execute({ task_id: paused.taskId }, execFor(parent))
   await cleanup()
 })
 
@@ -547,26 +548,22 @@ test('a recoverable worker error pauses instead of completing the task', async (
   await releaseDesktopControl()
 
   const parent = makeAgent('s1', 'standard')
-  const { ctx, tools, handlers } = makeContext({ sessionWorker: true })
+  const { ctx, tools, handlers, prompts } = makeContext({ sessionWorker: true })
   const cleanup = apply(ctx, {})
-  const started = await tools.get('computer_task').execute(taskArgs(), execFor(parent))
-
-  handlers.get('session/event')(
-    { header: { id: started.childId } },
-    { type: 'turn/end', data: { reason: { kind: 'error' } } },
-  )
-  for (let attempt = 0; attempt < 20 && parent.notices.length === 0; attempt += 1) {
+  const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
+  for (let attempt = 0; attempt < 20 && prompts.length === 0; attempt += 1) {
     await new Promise((resolve) => setImmediate(resolve))
   }
-  assert.equal(parent.notices.length, 1)
-  assert.match(parent.notices[0].content[0].text, /paused after worker:error/)
+  const childId = prompts[0].sessionId
 
-  const resumed = await tools.get('computer_task_resume').execute(
-    { task_id: started.taskId, instruction: 'Retry after the transient error.' },
-    execFor(parent),
+  handlers.get('session/event')(
+    { header: { id: childId } },
+    { type: 'turn/end', data: { reason: { kind: 'error' } } },
   )
-  assert.equal(resumed.status, 'resumed')
+  const paused = await running
+  assert.equal(paused.status, 'paused')
+  assert.equal(paused.childId, childId)
 
-  await tools.get('computer_task_cancel').execute({ task_id: started.taskId }, execFor(parent))
+  await tools.get('computer_task_cancel').execute({ task_id: paused.taskId }, execFor(parent))
   await cleanup()
 })

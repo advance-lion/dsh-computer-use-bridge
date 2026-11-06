@@ -10,7 +10,6 @@
 | --- | --- |
 | `computer_task` | 提交一个桌面任务，返回任务 ID 与工作会话 ID；结果通过完成通知回到原会话 |
 | `computer_desktop_status` | 报告桌面是否被占用、排队数量、本会话自己的在飞任务数 |
-| `computer_task_pause` | 暂停运行中的任务，释放桌面但保留同一个 GUI worker session |
 | `computer_task_resume` | 重新取得桌面租约，并向同一个 worker session 续发任务 |
 | `computer_task_cancel` | 彻底放弃任务，不保留可恢复记录 |
 | 任务级串行 | 从任务被接纳到工作会话结束期间独占桌面；等待者按 FIFO 排队 |
@@ -87,8 +86,8 @@ config:
 现在有两条真正生效的停止路径：
 
 1. **停掉发起会话的那一轮**（聊天里的停止按钮）→ 插件监听 `turn/end` 的 `aborted`，中断自己的桌面工作会话。这是最符合直觉的用法。
-2. **`computer_task_pause`** → 暂停运行中的任务，保留 worker session；之后用 `computer_task_resume` 继续。
-3. **`computer_task_cancel`** → 彻底放弃任务，不保留恢复入口。
+2. **Esc** → 暂停运行中的任务，保留 worker session；用户之后说“继续”时由模型调用 `computer_task_resume`。
+3. **`computer_task_cancel`** → 用户明确表示不再继续时，彻底放弃任务。
 
 恢复一定重新进入桌面 FIFO：暂停已经释放租约，不能继承暂停前的所有权。正常 `completed`、显式 cancel
 和队列中取消是终止状态；用户暂停、预算耗尽和 worker 的非完成结束原因进入可恢复暂停。
