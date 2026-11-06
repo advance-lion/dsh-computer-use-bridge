@@ -121,6 +121,18 @@ Desktop tasks have three distinct lifecycle controls:
   same session.
 - `computer_task_cancel` abandons the task without keeping a resumable task record.
 
+| Outcome | Action | Resumable |
+| --- | --- | --- |
+| User pause / parent-turn stop | Pause and release the desktop | Yes |
+| `maxRunSeconds` reached | Pause and release the desktop | Yes |
+| Worker ends with `error`, `max-tokens`, `refusal`, or another non-complete reason | Pause for human review | Yes |
+| Worker completes normally | Finish and deliver the completion notice | No |
+| User invokes `computer_task_cancel` | Abandon the task | No |
+| A queued task is cancelled | Remove it from the queue | No |
+
+Resume always re-enters the queue because pausing releases the desktop lease. It starts immediately when the
+desktop is free and otherwise waits in FIFO order; it keeps no priority from before the pause.
+
 Work the worker already observed and completed stays in that session history. If a pause happens during a
 GUI action, resume re-observes the current screen before continuing instead of blindly replaying successful
 actions.
@@ -237,7 +249,7 @@ If the preset is renamed or missing, the plugin says so in a startup self-check 
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-40 tests: FIFO / timeout / cancellation, task-scoped cross-process leases, manual stop and pause/resume in the same session, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, and degraded mode without the dependency.
+41 tests: FIFO / timeout / cancellation, task-scoped cross-process leases, manual stop and pause/resume in the same session, recovery from paused failures, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, and degraded mode without the dependency.
 
 Design rationale and the full verification record: [docs/design-notes.md](docs/design-notes.md).
 

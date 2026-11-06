@@ -119,6 +119,18 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 - `computer_task_resume`：重新申请桌面 FIFO 名额，然后向同一个 worker session 发送继续指令。
 - `computer_task_cancel`：彻底放弃任务，不保留可继续的任务记录。
 
+| 结果 | 处理 | 能否恢复 |
+| --- | --- | --- |
+| 用户主动暂停 / 停止父 turn | 暂停，释放桌面 | 是 |
+| 达到 `maxRunSeconds` | 暂停，释放桌面 | 是 |
+| worker 返回 `error` / `max-tokens` / `refusal` 等非完成原因 | 暂停等待人工判断 | 是 |
+| worker 正常完成 | 结束并发送完成通知 | 否 |
+| 用户执行 `computer_task_cancel` | 彻底放弃 | 否 |
+| 任务还在队列时被取消 | 直接出队 | 否 |
+
+恢复时任务必须重新排队：暂停会释放桌面，不能假定离开期间没有其他任务获得租约。桌面空闲时立即获得；
+忙碌时进入 FIFO，不保留暂停前的插队特权。
+
 worker 已经看过、已经完成的步骤仍在同一个 session 历史里。暂停发生在 GUI 动作过程中时，恢复会先重新观察
 当前屏幕，再继续未完成部分，不会盲目重放已经成功的动作。
 
@@ -231,7 +243,7 @@ OS handle 属于进程，但 lease 生命周期属于任务，不是插件加载
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-40 项测试：调度 FIFO / 超时 / 取消、任务级跨进程租约、手动停止与暂停后同 session 恢复、悬浮球对撞（用宿主实际加载的 dsh-orb 代码判定）、显式标记识别、缺依赖降级。
+41 项测试：调度 FIFO / 超时 / 取消、任务级跨进程租约、手动停止与暂停后同 session 恢复、失败暂停、悬浮球对撞（用宿主实际加载的 dsh-orb 代码判定）、显式标记识别、缺依赖降级。
 
 设计取舍与完整验证记录见 [docs/design-notes.md](docs/design-notes.md)。
 

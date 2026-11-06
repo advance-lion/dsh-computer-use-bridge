@@ -541,3 +541,32 @@ test('stopping the calling turn pauses a resumable session worker', async () => 
   await tools.get('computer_task_cancel').execute({ task_id: started.taskId }, execFor(parent))
   await cleanup()
 })
+
+test('a recoverable worker error pauses instead of completing the task', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const parent = makeAgent('s1', 'standard')
+  const { ctx, tools, handlers } = makeContext({ sessionWorker: true })
+  const cleanup = apply(ctx, {})
+  const started = await tools.get('computer_task').execute(taskArgs(), execFor(parent))
+
+  handlers.get('session/event')(
+    { header: { id: started.childId } },
+    { type: 'turn/end', data: { reason: { kind: 'error' } } },
+  )
+  for (let attempt = 0; attempt < 20 && parent.notices.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(parent.notices.length, 1)
+  assert.match(parent.notices[0].content[0].text, /paused after worker:error/)
+
+  const resumed = await tools.get('computer_task_resume').execute(
+    { task_id: started.taskId, instruction: 'Retry after the transient error.' },
+    execFor(parent),
+  )
+  assert.equal(resumed.status, 'resumed')
+
+  await tools.get('computer_task_cancel').execute({ task_id: started.taskId }, execFor(parent))
+  await cleanup()
+})
