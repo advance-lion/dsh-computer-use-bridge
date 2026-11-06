@@ -7,6 +7,7 @@ import test from 'node:test'
 process.env.DSH_DESKTOP_BRIDGE_CHANNEL = `dsh-desktop-bridge.test.${process.pid}`
 const { apply } = await import('../lib/index.js')
 const { desktopControlAddress, releaseDesktopControl } = await import('../lib/control-channel.js')
+const { readWorkerTrace } = await import('../lib/worker-session.js')
 
 const SCHEDULER_KEY = Symbol.for('dsh-desktop-bridge.scheduler')
 const OWNER_KEY = Symbol.for('dsh-orb.screen-owner')
@@ -19,12 +20,17 @@ function reset() {
 
 function makeAgent(id, preset) {
   const notices = []
+  const injected = []
   return {
     id,
     session: { header: { agentPreset: preset } },
     notices,
+    injected,
     followup(message) {
       notices.push(message)
+    },
+    inject(message) {
+      injected.push(message)
     },
   }
 }
@@ -37,8 +43,10 @@ function makeContext(options = {}) {
   const interrupts = []
   const activations = []
   const sessions = new Map()
+  const workerEvents = new Map()
   const prompts = []
   const cancels = []
+  const archives = []
   const presets = options.presets ?? ['standard', 'computer-use']
   const sessionController = options.sessionWorker
     ? {
@@ -57,9 +65,9 @@ function makeContext(options = {}) {
           cancels.push(request)
           return { accepted: true }
         },
-        async inspect() {
+        async inspect(sessionId) {
           return {
-            events: [{
+            events: workerEvents.get(sessionId) ?? [{
               type: 'assistant/message',
               data: { message: { content: [{ type: 'text', text: 'desktop task result' }] } },
             }],
@@ -67,6 +75,12 @@ function makeContext(options = {}) {
         },
       }
     : undefined
+
+  const workspaceRegistry = {
+    async archiveSession(sessionId, options) {
+      archives.push({ sessionId, options })
+    },
+  }
 
   const ctx = {
     tools: {
@@ -102,6 +116,7 @@ function makeContext(options = {}) {
     get(name) {
       if (name === 'agentPresets') return { list: async () => presets.map((id) => ({ id })) }
       if (name === 'sessionController') return sessionController
+      if (name === 'workspaceRegistry') return workspaceRegistry
       if (name === 'systemPrompt') {
         return {
           section(section) {
@@ -122,8 +137,10 @@ function makeContext(options = {}) {
     interrupts,
     activations,
     sessions,
+    workerEvents,
     prompts,
     cancels,
+    archives,
     finishAll: () => activations.forEach((a) => a.settle({ stopReason: 'completed', output: [] })),
   }
 }
@@ -139,6 +156,13 @@ function taskArgs(overrides = {}) {
 
 const execFor = (agent) => ({ agent, signal: new AbortController().signal, callId: 'c', rootCallId: 'c' })
 
+async function waitFor(condition, message) {
+  for (let attempt = 0; attempt < 50 && !condition(); attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(condition(), true, message)
+}
+
 /** An agent whose newest user turn is `text`, so the marker reader has something to read. */
 const agentWithText = (id, preset, text) => ({
   id,
@@ -148,6 +172,41 @@ const agentWithText = (id, preset, text) => ({
   },
 })
 
+function workerTraceEvents() {
+  return [
+    {
+      type: 'tool/call',
+      data: { callId: 'call-1', name: 'screenshot', arguments: '{"app":"Calculator"}' },
+    },
+    {
+      type: 'tool/result',
+      data: {
+        message: {
+          role: 'tool',
+          toolCallId: 'call-1',
+          source: { kind: 'tool', callId: 'call-1' },
+          content: [
+            { type: 'text', text: 'Calculator shows 56 after pressing equals.' },
+            {
+              type: 'image',
+              attachment: {
+                attachmentId: 'img-1',
+                name: 'calculator.png',
+                width: 800,
+                height: 600,
+              },
+            },
+          ],
+        },
+      },
+    },
+    {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: 'The export dialog is still waiting for input.' }] } },
+    },
+  ]
+}
+
 test('registers the task lifecycle tools', () => {
   reset()
   const { ctx, tools } = makeContext()
@@ -155,8 +214,6 @@ test('registers the task lifecycle tools', () => {
   assert.deepEqual([...tools.keys()].sort(), [
     'computer_desktop_status',
     'computer_task',
-    'computer_task_cancel',
-    'computer_task_resume',
   ])
   cleanup()
 })
@@ -327,23 +384,6 @@ test('a queued task is visible as waiting, and the holder is reported busy', asy
   await queuedRun
 })
 
-test('cancelling a running task interrupts its worker, and only for its own session', async () => {
-  reset()
-  const { ctx, tools, interrupts } = makeContext()
-  apply(ctx, {})
-
-  const started = await tools.get('computer_task').execute(taskArgs(), execFor(makeAgent('s1', 'standard')))
-  const cancel = tools.get('computer_task_cancel')
-
-  const foreign = await cancel.execute({ task_id: started.taskId }, execFor(makeAgent('s2', 'standard')))
-  assert.equal(foreign.result, 'not_found')
-  assert.deepEqual(interrupts, [])
-
-  const own = await cancel.execute({ task_id: started.taskId }, execFor(makeAgent('s1', 'standard')))
-  assert.equal(own.result, 'interrupted')
-  assert.deepEqual(interrupts, ['child-1'])
-})
-
 test('stopping the calling turn interrupts its worker', async () => {
   reset()
   const { ctx, tools, activations, handlers, interrupts } = makeContext()
@@ -451,21 +491,30 @@ test('a foreign process conflict is detected per task and does not leave the loc
   }
 })
 
-test('Escape pauses the active parent turn and resume continues the same worker session', async () => {
+test('Escape closes the worker and injects its trace into the original conversation', async () => {
   reset()
   await releaseDesktopControl()
 
   const parent = makeAgent('s1', 'standard')
-  const { ctx, tools, handlers, sessions, prompts, cancels } = makeContext({ sessionWorker: true })
+  const {
+    ctx,
+    tools,
+    handlers,
+    sessions,
+    workerEvents,
+    prompts,
+    cancels,
+    archives,
+    sections,
+  } = makeContext({ sessionWorker: true })
   const cleanup = apply(ctx, {})
 
   const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
-  for (let attempt = 0; attempt < 20 && prompts.length === 0; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
+  await waitFor(() => prompts.length === 1, 'the worker prompt should be admitted')
   assert.equal(prompts.length, 1)
   const childId = prompts[0].sessionId
   assert.equal(sessions.get(childId).agentPreset, 'computer-use')
+  workerEvents.set(childId, workerTraceEvents())
 
   handlers.get('session/event')(
     { header: { id: 's1' } },
@@ -480,81 +529,87 @@ test('Escape pauses the active parent turn and resume continues the same worker 
   const paused = await running
   assert.equal(paused.status, 'paused')
   assert.equal(paused.childId, childId)
-  for (let attempt = 0; attempt < 20 && globalThis[CONTROL_KEY]?.attempt !== undefined; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
+  await waitFor(() => globalThis[CONTROL_KEY]?.attempt === undefined, 'the desktop must be released')
   assert.equal(globalThis[CONTROL_KEY]?.attempt, undefined)
 
-  const resumedRun = tools.get('computer_task_resume').execute(
-    { task_id: paused.taskId, instruction: 'Finish the export dialog.' },
+  assert.deepEqual(archives, [
+    { sessionId: childId, options: { stopActivity: true } },
+  ])
+  assert.equal(parent.injected.length, 1)
+  assert.equal(parent.notices.length, 0, 'pausing must not create a new visible user turn')
+  assert.equal(parent.injected[0].source.kind, 'subagent-settled')
+  assert.equal(parent.injected[0].source.form, 'notice')
+  assert.equal(parent.injected[0].source.senderSessionId, childId)
+  const trace = parent.injected[0].content[0].text
+  assert.match(trace, /user pressed Escape/)
+  assert.match(trace, /Goal: click Export/)
+  assert.match(trace, /screenshot/)
+  assert.match(trace, /Calculator shows 56/)
+  assert.match(trace, /calculator\.png/)
+  assert.match(trace, /closed and is not resumable/)
+  assert.match(trace, /submit a new computer_task/)
+  assert.equal(sections.has('desktop-bridge-paused'), false)
+  assert.equal(tools.has('computer_task_resume'), false)
+
+  const nextRun = tools.get('computer_task').execute(
+    taskArgs({ goal: 'enter the remaining value' }),
     execFor(parent),
   )
-  for (let attempt = 0; attempt < 20 && prompts.length < 2; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
-  assert.equal(prompts.length, 2, 'resume must start a new turn in the same session')
-  assert.equal(prompts[1].sessionId, prompts[0].sessionId)
-  assert.match(prompts[1].content[0].text, /Resume the same desktop task/)
-  assert.match(prompts[1].content[0].text, /Finish the export dialog/)
+  await waitFor(() => prompts.length === 2, 'a later GUI request should create a fresh worker')
+  assert.notEqual(prompts[1].sessionId, childId)
+  workerEvents.set(prompts[1].sessionId, workerTraceEvents())
+  handlers.get('session/event')(
+    { header: { id: prompts[1].sessionId } },
+    { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+  )
+  const next = await nextRun
+  assert.equal(next.status, 'completed')
+  assert.notEqual(next.childId, childId)
+  assert.equal(archives.length, 2)
+
+  await cleanup()
+})
+
+test('normal completion closes and archives the worker while returning its trace as the tool result', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const parent = makeAgent('s1', 'standard')
+  const { ctx, tools, handlers, workerEvents, prompts, archives } = makeContext({ sessionWorker: true })
+  const cleanup = apply(ctx, {})
+  const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
+  await waitFor(() => prompts.length === 1, 'the worker prompt should be admitted')
+  const childId = prompts[0].sessionId
+  workerEvents.set(childId, workerTraceEvents())
 
   handlers.get('session/event')(
     { header: { id: childId } },
     { type: 'turn/end', data: { reason: { kind: 'completed' } } },
   )
-  const resumed = await resumedRun
-  assert.equal(resumed.status, 'completed')
-  assert.equal(resumed.childId, childId)
-  assert.equal(resumed.result, 'desktop task result')
 
+  const completed = await running
+  assert.equal(completed.status, 'completed')
+  assert.equal(completed.childId, childId)
+  assert.match(completed.result, /worker completed its turn/)
+  assert.match(completed.result, /Calculator shows 56/)
+  assert.deepEqual(archives, [
+    { sessionId: childId, options: { stopActivity: true } },
+  ])
+  assert.equal(parent.injected.length, 0, 'the normal tool result already carries the trace')
   await cleanup()
 })
 
-test('Escape records a paused task for the next parent turn', async () => {
+test('a recoverable worker error closes the worker without creating a paused task record', async () => {
   reset()
   await releaseDesktopControl()
 
   const parent = makeAgent('s1', 'standard')
-  const { ctx, tools, handlers, sections, sessions, cancels, prompts } = makeContext({ sessionWorker: true })
+  const { ctx, tools, handlers, workerEvents, prompts, archives } = makeContext({ sessionWorker: true })
   const cleanup = apply(ctx, {})
   const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
-  for (let attempt = 0; attempt < 20 && prompts.length === 0; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
-
-  handlers.get('session/event')(
-    { header: { id: 's1' } },
-    { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
-  )
-  const childId = cancels[0].sessionId
-  assert.equal(typeof childId, 'string')
-
-  handlers.get('session/event')(
-    { header: { id: childId } },
-    { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
-  )
-  const paused = await running
-  assert.equal(paused.status, 'paused')
-  assert.equal(sessions.has(paused.childId), true)
-  const prompt = sections.get('desktop-bridge-paused').text({ agent: parent })
-  assert.match(prompt, new RegExp(paused.taskId))
-  assert.match(prompt, /user pauses desktop work with Escape/)
-
-  await tools.get('computer_task_cancel').execute({ task_id: paused.taskId }, execFor(parent))
-  await cleanup()
-})
-
-test('a recoverable worker error pauses instead of completing the task', async () => {
-  reset()
-  await releaseDesktopControl()
-
-  const parent = makeAgent('s1', 'standard')
-  const { ctx, tools, handlers, prompts } = makeContext({ sessionWorker: true })
-  const cleanup = apply(ctx, {})
-  const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
-  for (let attempt = 0; attempt < 20 && prompts.length === 0; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
+  await waitFor(() => prompts.length === 1, 'the worker prompt should be admitted')
   const childId = prompts[0].sessionId
+  workerEvents.set(childId, workerTraceEvents())
 
   handlers.get('session/event')(
     { header: { id: childId } },
@@ -563,7 +618,65 @@ test('a recoverable worker error pauses instead of completing the task', async (
   const paused = await running
   assert.equal(paused.status, 'paused')
   assert.equal(paused.childId, childId)
+  assert.match(paused.result, /worker stopped without completing/)
+  assert.deepEqual(archives, [
+    { sessionId: childId, options: { stopActivity: true } },
+  ])
+  assert.equal(parent.injected.length, 0, 'an ordinary tool result does not need a second injected copy')
 
-  await tools.get('computer_task_cancel').execute({ task_id: paused.taskId }, execFor(parent))
   await cleanup()
+})
+
+test('the worker trace is bounded and keeps screenshot references without copying image bytes', async () => {
+  const events = []
+  for (let index = 0; index < 60; index += 1) {
+    const callId = `bulk-${index}`
+    events.push({
+      type: 'tool/call',
+      data: { callId, name: 'screenshot', arguments: `{"step":${index}}` },
+    })
+    events.push({
+      type: 'tool/result',
+      data: {
+        message: {
+          role: 'tool',
+          toolCallId: callId,
+          source: { kind: 'tool', callId },
+          content: [
+            { type: 'text', text: `observation ${index} `.repeat(60) },
+            {
+              type: 'image',
+              attachment: {
+                attachmentId: `image-${index}`,
+                name: `screen-${index}.png`,
+                width: 800,
+                height: 600,
+              },
+            },
+          ],
+        },
+      },
+    })
+  }
+
+  const ctx = {
+    get(name) {
+      if (name !== 'sessionController') return undefined
+      return { async inspect() { return { events } } }
+    },
+  }
+  const trace = await readWorkerTrace(ctx, {
+    taskId: 'dt-bulk',
+    childId: 'desktop-bulk',
+    args: {
+      goal: 'inspect a very long GUI workflow',
+      stop_condition: 'the final dialog is visible',
+    },
+  }, { status: 'paused', reason: 'user' })
+
+  assert.ok(trace.length <= 12_000)
+  assert.match(trace, /middle of trace omitted/)
+  assert.match(trace, /Screen observations captured by the worker: 60/)
+  assert.match(trace, /Latest screen references: screen-58\.png/)
+  assert.match(trace, /closed and is not resumable/)
 })

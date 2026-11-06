@@ -47,7 +47,7 @@ DSH 会写代码、会跑命令，但它**看不见屏幕上正在发生什么**
 | 显式调用 `@Computer` | ✅ | ✅ `@computer` / `@desktop` / `@电脑` |
 | 结构化优先（插件 / MCP 先行） | ✅ | ✅ 写进工具判据 |
 | 桌面同一时刻一个执行者 | 平台级 | ✅ 任务租约 + 跨进程独占 |
-| 随「停止」一起停 | ✅ | ✅ 按 Esc 暂停工作会话，可继续 |
+| 随「停止」一起停 | ✅ | ✅ 按 Esc 停止并关闭工作会话，轨迹回到原对话 |
 | 单任务预算上限 | ✅ | ✅ 步数 / 时长可配 |
 | 独立光标、后台操作 | macOS 后台操作；Windows 前台独占 | macOS（dsh-orb 后台操作）；Windows（dsh-orb 前台独占） |
 | 逐动作人工确认 | ✅ | ⚠️ 部分：敏感动作靠预算与停止，逐动作弹窗未做 |
@@ -111,33 +111,32 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 
 ---
 
-## 手动停止与继续
+## 按 Esc 暂停：轨迹回到原对话
 
-用户只负责暂停：运行桌面任务时按 **Esc**。bridge 会取消当前 worker turn 并释放桌面租约，但保留同一个
-GUI session。用户不需要选择“暂停还是取消”，也不需要管理 task id 或恢复按钮。
+用户只需要按 **Esc**。它暂停的是这一次 GUI 操作，不是保留一个跨消息的可恢复任务。
 
-之后用户说“继续”时，模型会调用内部工具 `computer_task_resume`：重新申请桌面 FIFO 名额，然后向同一个
-worker session 发送继续指令。`computer_task_cancel` 只用于用户明确表示“不再继续这个任务”时清理记录。
+bridge 会立即取消当前 worker turn、释放桌面租约，然后归档这个一次性 GUI session。暂停前已经发生的工具调用、
+结果、错误、最后一轮 worker 消息和最新截图引用会压成一段有界轨迹，通过 `parent.inject()` 注入回**原来的 Agent
+对话**。这条上下文不会主动唤醒模型；用户下一条自然消息会带着这段轨迹继续。
 
-| 结果 | 处理 | 能否恢复 |
+| 结果 | 处理 | 下一步 |
 | --- | --- | --- |
-| 用户按 Esc / 停止父 turn | 暂停，释放桌面 | 是，用户说“继续”即可 |
-| 达到 `maxRunSeconds` | 暂停，释放桌面 | 是 |
-| worker 返回 `error` / `max-tokens` / `refusal` 等非完成原因 | 暂停等待人工判断 | 是 |
-| worker 正常完成 | 结束并发送完成通知 | 否 |
-| 用户执行 `computer_task_cancel` | 彻底放弃 | 否 |
-| 任务还在队列时被取消 | 直接出队 | 否 |
+| 用户按 Esc / 停止父 turn | 中断、释放桌面、归档 worker，把 Escape 事件与轨迹注入原对话 | 用户直接说下一句；若还需 GUI，模型新开一个 worker |
+| 达到 `maxRunSeconds` | 中断、释放桌面、归档 worker，把停止原因与轨迹作为工具结果返回 | 原 Agent 根据轨迹继续或新开 worker |
+| worker 返回 `error` / `max-tokens` / `refusal` 等非完成原因 | 结束、释放桌面、归档 worker，把失败与已有轨迹交回原对话 | 原 Agent 判断是否换结构化路线或重试 |
+| worker 正常完成 | 归档 worker，把完成状态与有界轨迹作为工具结果返回 | 原 Agent 直接答复用户 |
+| 任务还在排队时按 Esc | 直接出队，不创建 worker | 终止 |
 
-恢复时任务必须重新排队：暂停会释放桌面，不能假定离开期间没有其他任务获得租约。桌面空闲时立即获得；
-忙碌时进入 FIFO，不保留暂停前的插队特权。
+这里没有 `computer_task_resume`。GUI worker 和一次性的 subagent 一样，只服务一次 `computer_task`；完整 worker
+日志和截图附件仍留在归档历史中，但不会把每张图都塞进父会话。下一次 GUI 操作会创建新的 worker，并重新观察
+当前屏幕，因为它离开期间页面状态可能已经被用户或其它任务改变。
 
-为了让 Esc 可中断，Session worker 路径会让 `computer_task` 在 worker 运行期间保持当前父 turn 活跃；
-完成或暂停后工具才返回。于是用户无需理解 pause/cancel 工具，也不需要另行点击恢复。
+新版本 DSH 仍然提供一次性 `ctx.subagents.start()`，但 bridge 还需要在创建时选中 dsh-orb 的 `computer-use`
+preset；当前 subagent 的公开一次性请求没有这个选项，所以这里通过 `sessionController.create()` 创建一个只活一次
+的 GUI session。选择 session 只是获得 preset 能力，不改变“一次性、结束后回收”的 subagent 语义。
 
-worker 已经看过、已经完成的步骤仍在同一个 session 历史里。暂停发生在 GUI 动作过程中时，恢复会先重新观察
-当前屏幕，再继续未完成部分，不会盲目重放已经成功的动作。
-
-当前恢复依赖同一个 DSH Host 进程中的任务记录；应用完全重启后的恢复入口尚未持久化。
+为了让 Esc 可中断，`computer_task` 会在 worker 运行期间保持当前父 turn 活跃。完成时工具结果进入原 turn；
+用户中止父 turn 时，工具结果无法可靠落盘，所以暂停路径改用注入，而不是要求用户再说“继续”。
 
 ---
 
@@ -236,7 +235,8 @@ OS handle 属于进程，但 lease 生命周期属于任务，不是插件加载
 
 - **worker 可能点到被遮挡的窗口。** 首次真实运行时，计算器被其它窗口挡住，几个点击落到了编辑器上，误开了一个标签页（已自行关闭）。目标窗口不在前台时，先手动带到最前。
 - **没有原生状态面板。** 状态通过 `computer_desktop_status` 查询。
-- **暂停不跨进程重启。** 同一个 DSH Host 进程内可以暂停并继续；应用重启后当前版本不会恢复任务记录。
+- **暂停会结束 worker。** 这是有意设计：GUI 页面可能在离开期间变化，下一次 GUI 操作会新建 worker 并重新观察
+  当前画面；不会恢复旧页面假设。
 
 ---
 
@@ -246,7 +246,7 @@ OS handle 属于进程，但 lease 生命周期属于任务，不是插件加载
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-41 项测试：调度 FIFO / 超时 / 取消、任务级跨进程租约、手动停止与暂停后同 session 恢复、失败暂停、悬浮球对撞（用宿主实际加载的 dsh-orb 代码判定）、显式标记识别、缺依赖降级。
+41 项测试：调度 FIFO / 超时 / 取消、任务级跨进程租约、Esc 后一次性 worker 归档与轨迹注入、完成后归档、worker 失败收尾、轨迹长度上界、悬浮球对撞（用宿主实际加载的 dsh-orb 代码判定）、显式标记识别、缺依赖降级。
 
 设计取舍与完整验证记录见 [docs/design-notes.md](docs/design-notes.md)。
 

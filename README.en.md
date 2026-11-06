@@ -47,7 +47,7 @@ your session ──computer_task──▶ desktop worker ──▶ screenshot / 
 | Explicit `@Computer` invocation | ✅ | ✅ `@computer` / `@desktop` |
 | Structured integrations first (plugin / MCP) | ✅ | ✅ built into the tool criteria |
 | One executor on the desktop | platform-level | ✅ task lease + cross-process claim |
-| Stops when you stop | ✅ | ✅ Escape pauses the worker for continuation |
+| Stops when you stop | ✅ | ✅ Escape stops and closes the worker, returning its trace to the original chat |
 | Per-task budget cap | ✅ | ✅ time-and-queue limits, configurable |
 | Independent cursor, background operation | macOS background; Windows foreground-only | macOS (dsh-orb background); Windows (dsh-orb foreground-only) |
 | Per-action human confirmation | ✅ | ⚠️ partial: budget and stop, no per-click prompt yet |
@@ -111,37 +111,37 @@ The still frame below is the verified end state:
 
 ---
 
-## Pause and continue
+## Escape pauses: the trace returns to the original chat
 
-The user has one pause control: press **Escape** while desktop work is running. The bridge cancels the active
-worker turn and releases the desktop lease while keeping the same GUI worker session. The user does not choose
-between pause and cancel, manage task ids, or operate a separate resume control.
+The user has one control: press **Escape**. It pauses the current GUI operation; it does not preserve a
+cross-message task that can be resumed later.
 
-If the user later says “continue”, the model calls the internal `computer_task_resume` tool. It acquires the
-desktop FIFO slot again and sends a continuation prompt into the same worker session. `computer_task_cancel`
-is only for the user explicitly saying they no longer want the task.
+The bridge cancels the active worker turn, releases the desktop lease, and archives the one-shot GUI session.
+The tool calls, results, errors, latest worker message, and latest screenshot references from before the pause
+are reduced to a bounded trace and injected into the **original Agent conversation** through `parent.inject()`.
+That context does not wake the model by itself; the user's next ordinary message continues with the trace.
 
-| Outcome | Action | Resumable |
+| Outcome | Action | Next step |
 | --- | --- | --- |
-| User presses Escape / parent-turn stop | Pause and release the desktop | Yes, by saying “continue” |
-| `maxRunSeconds` reached | Pause and release the desktop | Yes |
-| Worker ends with `error`, `max-tokens`, `refusal`, or another non-complete reason | Pause for human review | Yes |
-| Worker completes normally | Finish and deliver the completion notice | No |
-| User invokes `computer_task_cancel` | Abandon the task | No |
-| A queued task is cancelled | Remove it from the queue | No |
+| User presses Escape / parent turn stops | Interrupt, release the desktop, archive the worker, inject the Escape event and trace | The user just sends the next message; if GUI work is still needed, the model starts a fresh worker |
+| `maxRunSeconds` is reached | Interrupt, release, archive, and return the stop reason plus trace as the tool result | The original Agent continues from the evidence or starts a fresh worker |
+| Worker ends with `error`, `max-tokens`, `refusal`, or another non-complete reason | Close and archive it, returning the failure and available trace | The original Agent chooses another route or retries |
+| Worker completes normally | Archive it and return the completion status plus bounded trace as the tool result | The original Agent answers the user |
+| User presses Escape while the task is queued | Remove it from the queue without creating a worker | Terminated |
 
-Resume always re-enters the queue because pausing releases the desktop lease. It starts immediately when the
-desktop is free and otherwise waits in FIFO order; it keeps no priority from before the pause.
+There is no `computer_task_resume`. Like a one-shot subagent, a GUI worker serves exactly one `computer_task`.
+The complete worker log and image attachments remain in archived history, but every screenshot is not copied
+into the parent context. The next GUI action starts a new worker and observes the current screen again because
+the page may have changed while the previous worker was away.
 
-So Escape can interrupt it, the Session worker path keeps the current parent turn active while `computer_task`
-runs. The tool returns only after completion or pause; users never need to understand pause/cancel tooling.
+Current DSH still provides one-shot `ctx.subagents.start()`, but bridge also has to select dsh-orb's
+`computer-use` preset at creation. The public one-shot subagent request has no preset option, so bridge uses
+`sessionController.create()` to create a GUI session that lives for one invocation. Session is the mechanism
+that exposes the preset; it does not change the one-shot, dispose-after-use subagent lifecycle.
 
-Work the worker already observed and completed stays in that session history. If a pause happens during a
-GUI action, resume re-observes the current screen before continuing instead of blindly replaying successful
-actions.
-
-Resume currently relies on task state in the same DSH Host process; task records do not survive a full
-application restart.
+So Escape can interrupt it, `computer_task` keeps the current parent turn active while the worker runs. A
+normal completion returns through the tool result. When the user aborts the parent turn, that result cannot
+be delivered reliably, so the pause path injects the trace instead of asking the user to say “continue”.
 
 ---
 
@@ -241,8 +241,8 @@ If the preset is renamed or missing, the plugin says so in a startup self-check 
 
 - **The worker can click an occluded window.** In the first real run the calculator sat behind another window and a few clicks landed in an editor, opening a stray tab (which it then closed). Bring the target app to the front, or say so in the task.
 - **No native status panel.** State is available through `computer_desktop_status`.
-- **Pause is not durable across restarts.** Pause/resume works inside one DSH Host process; task records are not
-  persisted across a full application restart yet.
+- **Pause ends the worker.** This is deliberate: the GUI may change while the worker is away, so the next GUI
+  action starts a fresh worker and observes the current screen instead of restoring stale page assumptions.
 
 ---
 
@@ -252,7 +252,7 @@ If the preset is renamed or missing, the plugin says so in a startup self-check 
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-41 tests: FIFO / timeout / cancellation, task-scoped cross-process leases, manual stop and pause/resume in the same session, recovery from paused failures, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, and degraded mode without the dependency.
+41 tests: FIFO / timeout / cancellation, task-scoped cross-process leases, one-shot archive and trace injection after Escape, archive on completion, worker-failure cleanup, trace-size bounding, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, and degraded mode without the dependency.
 
 Design rationale and the full verification record: [docs/design-notes.md](docs/design-notes.md).
 
