@@ -18,7 +18,15 @@ function reset() {
 }
 
 function makeAgent(id, preset) {
-  return { id, session: { header: { agentPreset: preset } } }
+  const notices = []
+  return {
+    id,
+    session: { header: { agentPreset: preset } },
+    notices,
+    followup(message) {
+      notices.push(message)
+    },
+  }
 }
 
 /** Minimal Cordis context: only the surfaces the plugin touches. */
@@ -28,7 +36,37 @@ function makeContext(options = {}) {
   const sections = new Map()
   const interrupts = []
   const activations = []
+  const sessions = new Map()
+  const prompts = []
+  const cancels = []
   const presets = options.presets ?? ['standard', 'computer-use']
+  const sessionController = options.sessionWorker
+    ? {
+        async create(request) {
+          sessions.set(request.sessionId, { ...request })
+          return { sessionId: request.sessionId, agentPreset: request.agentPreset }
+        },
+        async selectModel() {
+          return { selected: {} }
+        },
+        async prompt(request) {
+          prompts.push(request)
+          return { accepted: true }
+        },
+        cancel(request) {
+          cancels.push(request)
+          return { accepted: true }
+        },
+        async inspect() {
+          return {
+            events: [{
+              type: 'assistant/message',
+              data: { message: { content: [{ type: 'text', text: 'desktop task result' }] } },
+            }],
+          }
+        },
+      }
+    : undefined
 
   const ctx = {
     tools: {
@@ -63,6 +101,7 @@ function makeContext(options = {}) {
     },
     get(name) {
       if (name === 'agentPresets') return { list: async () => presets.map((id) => ({ id })) }
+      if (name === 'sessionController') return sessionController
       if (name === 'systemPrompt') {
         return {
           section(section) {
@@ -82,6 +121,9 @@ function makeContext(options = {}) {
     sections,
     interrupts,
     activations,
+    sessions,
+    prompts,
+    cancels,
     finishAll: () => activations.forEach((a) => a.settle({ stopReason: 'completed', output: [] })),
   }
 }
@@ -106,11 +148,17 @@ const agentWithText = (id, preset, text) => ({
   },
 })
 
-test('registers the three tools', () => {
+test('registers the task lifecycle tools', () => {
   reset()
   const { ctx, tools } = makeContext()
   const cleanup = apply(ctx, {})
-  assert.deepEqual([...tools.keys()].sort(), ['computer_desktop_status', 'computer_task', 'computer_task_cancel'])
+  assert.deepEqual([...tools.keys()].sort(), [
+    'computer_desktop_status',
+    'computer_task',
+    'computer_task_cancel',
+    'computer_task_pause',
+    'computer_task_resume',
+  ])
   cleanup()
 })
 
@@ -402,4 +450,94 @@ test('a foreign process conflict is detected per task and does not leave the loc
     await new Promise((done) => foreign.close(done))
     await cleanup()
   }
+})
+
+test('pause keeps the worker session and resume continues it from the same context', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const parent = makeAgent('s1', 'standard')
+  const {
+    ctx,
+    tools,
+    handlers,
+    sessions,
+    prompts,
+    cancels,
+  } = makeContext({ sessionWorker: true })
+  const cleanup = apply(ctx, {})
+
+  const started = await tools.get('computer_task').execute(taskArgs(), execFor(parent))
+  assert.equal(sessions.get(started.childId).agentPreset, 'computer-use')
+  assert.equal(prompts.length, 1)
+
+  const paused = await tools
+    .get('computer_task_pause')
+    .execute({ task_id: started.taskId }, execFor(parent))
+  assert.equal(paused.result, 'pausing')
+  assert.deepEqual(cancels, [{ sessionId: started.childId }])
+
+  handlers.get('session/event')(
+    { header: { id: started.childId } },
+    { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
+  )
+  for (let attempt = 0; attempt < 20 && globalThis[CONTROL_KEY]?.attempt !== undefined; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(globalThis[CONTROL_KEY]?.attempt, undefined)
+
+  const resumed = await tools.get('computer_task_resume').execute(
+    { task_id: started.taskId, instruction: 'Finish the export dialog.' },
+    execFor(parent),
+  )
+  assert.equal(resumed.status, 'resumed')
+  assert.equal(resumed.childId, started.childId)
+  assert.equal(prompts.length, 2)
+  assert.equal(prompts[1].sessionId, prompts[0].sessionId)
+  assert.match(prompts[1].content[0].text, /Resume the same desktop task/)
+  assert.match(prompts[1].content[0].text, /Finish the export dialog/)
+
+  handlers.get('session/event')(
+    { header: { id: started.childId } },
+    { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+  )
+  for (let attempt = 0; attempt < 20 && parent.notices.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(parent.notices.length, 1)
+  assert.equal(parent.notices[0].source.kind, 'subagent-settled')
+
+  await cleanup()
+})
+
+test('stopping the calling turn pauses a resumable session worker', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const parent = makeAgent('s1', 'standard')
+  const { ctx, tools, handlers, sessions, cancels } = makeContext({ sessionWorker: true })
+  const cleanup = apply(ctx, {})
+  const started = await tools.get('computer_task').execute(taskArgs(), execFor(parent))
+
+  handlers.get('session/event')(
+    { header: { id: 's1' } },
+    { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
+  )
+  assert.deepEqual(cancels, [{ sessionId: started.childId }])
+
+  handlers.get('session/event')(
+    { header: { id: started.childId } },
+    { type: 'turn/end', data: { reason: { kind: 'aborted' } } },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const resumed = await tools.get('computer_task_resume').execute(
+    { task_id: started.taskId },
+    execFor(parent),
+  )
+  assert.equal(resumed.status, 'resumed')
+  assert.equal(sessions.has(started.childId), true)
+
+  await tools.get('computer_task_cancel').execute({ task_id: started.taskId }, execFor(parent))
+  await cleanup()
 })

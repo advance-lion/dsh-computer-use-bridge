@@ -47,9 +47,9 @@ your session ──computer_task──▶ desktop worker ──▶ screenshot / 
 | Explicit `@Computer` invocation | ✅ | ✅ `@computer` / `@desktop` |
 | Structured integrations first (plugin / MCP) | ✅ | ✅ built into the tool criteria |
 | One executor on the desktop | platform-level | ✅ task lease + cross-process claim |
-| Stops when you stop | ✅ | ✅ stopping the turn interrupts the worker |
+| Stops when you stop | ✅ | ✅ pauses the worker for continuation |
 | Per-task budget cap | ✅ | ✅ time-and-queue limits, configurable |
-| Independent cursor, background operation | macOS only | ⚠️ macOS background capability depends on dsh-orb; Windows is foreground-only |
+| Independent cursor, background operation | macOS background; Windows foreground-only | macOS (dsh-orb background); Windows (dsh-orb foreground-only) |
 | Per-action human confirmation | ✅ | ⚠️ partial: budget and stop, no per-click prompt yet |
 
 > In short: **the execution surface is on par with Codex; the scheduling and safety model is rebuilt for how DSH actually runs.**
@@ -111,6 +111,25 @@ The still frame below is the verified end state:
 
 ---
 
+## Pause and continue
+
+Desktop tasks have three distinct lifecycle controls:
+
+- `computer_task_pause` cancels the active worker turn and releases the desktop lease while keeping the
+  same GUI worker session.
+- `computer_task_resume` acquires the desktop FIFO slot again and sends a continuation prompt into that
+  same session.
+- `computer_task_cancel` abandons the task without keeping a resumable task record.
+
+Work the worker already observed and completed stays in that session history. If a pause happens during a
+GUI action, resume re-observes the current screen before continuing instead of blindly replaying successful
+actions.
+
+Resume currently relies on task state in the same DSH Host process; task records do not survive a full
+application restart.
+
+---
+
 ## When it actually gets used
 
 The criterion is borrowed from Codex: **when a task depends on a graphical interface that cannot be verified from files or command output alone**, hand it to the GUI.
@@ -138,7 +157,7 @@ The criterion is borrowed from Codex: **when a task depends on a graphical inter
 - **No preemption.** A busy desktop means queueing or timing out, never interrupting a running task.
 - **Not cross-machine.** It drives the host desktop, not the device your browser runs on.
 - **Not everything is automatable.** Terminal apps, DSH itself, and admin-authorised system dialogs are out of scope.
-- **Windows is foreground-only.** It really takes over pointer and keyboard; the independent cursor and background operation Codex has on macOS are not available here.
+- **Windows is foreground-only.** It really takes over pointer and keyboard; dsh-orb provides macOS background operation, while bridge adds no independent cursor of its own.
 - **macOS requires system permissions.** Screen Recording lets dsh-orb see windows, and Accessibility lets it click
   and type. Grant them to the DeepSeek Harness app or the terminal process hosting dsh-orb.
 
@@ -207,7 +226,8 @@ If the preset is renamed or missing, the plugin says so in a startup self-check 
 
 - **The worker can click an occluded window.** In the first real run the calculator sat behind another window and a few clicks landed in an editor, opening a stray tab (which it then closed). Bring the target app to the front, or say so in the task.
 - **No native status panel.** State is available through `computer_desktop_status`.
-- **No "stop the current task and hand over immediately"** — only queue cancellation, budget expiry, and stop-following.
+- **Pause is not durable across restarts.** Pause/resume works inside one DSH Host process; task records are not
+  persisted across a full application restart yet.
 
 ---
 
@@ -217,7 +237,7 @@ If the preset is renamed or missing, the plugin says so in a startup self-check 
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-38 tests: FIFO / timeout / cancellation, task-scoped cross-process leases, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, stop-following, and degraded mode without the dependency.
+40 tests: FIFO / timeout / cancellation, task-scoped cross-process leases, manual stop and pause/resume in the same session, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, and degraded mode without the dependency.
 
 Design rationale and the full verification record: [docs/design-notes.md](docs/design-notes.md).
 

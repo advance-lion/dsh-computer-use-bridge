@@ -16,6 +16,7 @@
     "lib/control-channel.js",
     "lib/orb-compat.js",
     "lib/trigger.js",
+    "lib/worker-session.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"
