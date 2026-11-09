@@ -14,7 +14,7 @@
 | 屏幕所有者接管 | 运行期间把 dsh-orb 的 screen-owner 指向工作会话，悬浮球的其它会话无法同时操作 |
 | 预算 | 单任务执行上限 `maxRunSeconds`，到点中断工作会话 |
 | 防递归 | 工作会话本身（`computer-use` 预设）不能再提交桌面任务 |
-| 跟着「停止」一起停 | 发起会话的那一轮被中止时，worker 一并中断、归档，并把 Escape 事件与轨迹注入原会话 |
+| 跟着「停止」一起停 | bridge 独立 Shift+Esc / 原对话停止中断 worker，实际调用收尾后归档并回传轨迹 |
 
 ## 什么时候触发（对齐 Codex 的判据）
 
@@ -77,19 +77,25 @@ config:
   workerModel: your-image-capable-model
 ```
 
-## 紧急停止：为什么不直接用悬浮球的暂停按钮
+## 紧急停止：独立 Shift+Esc，无需修改 orb
 
-悬浮球的暂停按钮停的是**悬浮球自己那个会话**。桥接的桌面工作会话是**调用会话的子会话**，是两个不同的 session；dsh-orb 里唯一的跨会话协调面是 `screen-owner`，它没有任何「中断其它会话」的调用。所以按悬浮球的暂停，桥上正在点的那只手不会停。
+原版 orb 的停止按钮只针对球自己的会话，本插件不模拟点击它，也不依赖适配版或私有协议。
+bridge 每个任务启动一个独立 Node helper，通过 koffi 注册系统 Shift+Esc（Windows RegisterHotKey / macOS Carbon）。
+注册成功才允许发送 worker prompt；注册失败明确拒绝 GUI 启动。任务结束通过 IPC 让 helper 注销并退出；
+宿主断开也退出。每个 helper 的回调绑定其任务，不会把旧事件交给后来的任务。macOS 尚需真机验收。
 
-用户只有一个停止操作：**Esc**，效果等同停掉发起会话的那一轮。插件监听父 `turn/end` 的 `aborted`，中断
-worker、释放桌面并归档这个一次性 session。随后它读取 worker 日志，压缩成有界轨迹，并连同“用户按了 Esc”
-事件通过 `parent.inject()` 放回原 Agent 会话；注入本身不唤醒模型，用户下一条普通消息会自然接上这段上下文。
+停止回调关闭 worker 的 TaskGate，合并取消信号经 DSH tools/execute 传给工具，再通过 sessionController.cancel
+取消 worker（保留父 turn）。tools/pre-execute 拒绝迟到的调用；tools/execute 再检查一次以覆盖异步准入竞争。
+收到 turn/end 后还要等所有已进入的 next() Promise 和 finally 返回，才释放租约。父 turn 本轮禁止重开 GUI；
+轨迹以正常工具结果返回。父 turn 自己被取消时才走 parent.inject，注入不唤醒模型。
+不使用 Promise.race 假装停止，不依赖 orb.whenIdle 或新增 orb 服务，也不杀掉 DSH 主进程。
+不响应取消的调用保留租约，状态为 stopping。已送进系统的输入无法回滚。原对话停止按钮仍有效，单按 Esc 不保证全局停止。
 
-这里没有 worker 恢复。正常完成把同一份轨迹作为 `computer_task` 的 `tool/result` 返回；Esc、预算耗尽和
+这里没有 worker 恢复。正常完成把同一份轨迹作为 `computer_task` 的 `tool/result` 返回；用户停止、预算耗尽和
 worker 报错都会结束并归档 worker。下一次 GUI 操作会创建新 session，先看当前屏幕，再继续未完成工作。这样
 与一次性 subagent 的生命周期一致，也避免在用户离开期间页面变化后继续依赖过期的 GUI 假设。
 
-用户不需要理解 pause 与 cancel：Esc 是唯一停止操作。`maxRunSeconds` 到点也会自动中断，作为预算兜底。
+用户不需要区分 pause 与 cancel，也不需要管理恢复命令。`maxRunSeconds` 到点会自动中断，作为预算兜底。
 
 ## 前置依赖
 
@@ -145,7 +151,7 @@ DSH 的安装闸门只校验 `engines.dsh` 与 DSH 自身的 peer 包，**不会
 
 1. **只在最近的宿主上验证过启动链路**：任务的创建、排队、屏幕归属和结果回传已验证；完整的并发抢占场景仍需要在真实桌面上逐条跑验收用例。
 2. **跨进程**：bridge 用命名管道或 Unix domain socket 为单个 `computer_task` 申请独占租约；插件加载本身不占用桌面，worker 结束后释放。dsh-orb 自己的动作锁仍只在进程内有效。
-3. **人工停止与一次性 worker**：Esc 会中断当前 turn、释放桌面、归档 worker，并把有界轨迹注入原会话；下一次 GUI 操作会新建 worker。
+3. **人工停止与一次性 worker**：独立 Shift+Esc 中断 worker，经正常工具结果回传；父对话停止则用非唤醒注入。等待已进入工具调用收尾后才释放桌面。
 4. **无人值守**：没有实现「定时任务默认拒绝桌面」的开关，需要后续补充。
 5. **没有原生 UI**：状态通过工具获取，尚无全局状态面板与紧急停止按钮。PRD 里这属于正式上线必备项。
 6. **用户正在操作电脑**时不会自动询问；`mode: auto` 下由模型自行判断，建议需要更严格时改成 `explicit_only`。

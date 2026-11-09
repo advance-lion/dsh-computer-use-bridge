@@ -47,13 +47,13 @@ DSH 会写代码、会跑命令，但它**看不见屏幕上正在发生什么**
 | 显式调用 `@Computer` | ✅ | ✅ `@computer` / `@desktop` / `@电脑` |
 | 结构化优先（插件 / MCP 先行） | ✅ | ✅ 写进工具判据 |
 | 桌面同一时刻一个执行者 | 平台级 | ✅ 任务租约 + 跨进程独占 |
-| 随「停止」一起停 | ✅ | ✅ 按 Esc 停止并关闭工作会话，轨迹回到原对话 |
+| 随「停止」一起停 | ✅ | ✅ bridge 独立 Shift+Esc / 原对话停止，轨迹回到原对话 |
 | 单任务预算上限 | ✅ | ✅ 步数 / 时长可配 |
 | 独立光标、后台操作 | macOS 后台操作；Windows 前台独占 | macOS（dsh-orb 后台操作）；Windows（dsh-orb 前台独占） |
 | 逐动作人工确认 | ✅ | ⚠️ 部分：敏感动作靠预算与停止，逐动作弹窗未做 |
 
 > 换句话说：**执行能力和 Codex 是同一档，调度和安全模型按 DSH 的实际情况重做过。**
-> 缺的两项（独立光标、逐动作确认）写在下面的「边界」里，不藏。
+> 平台操作方式与逐动作确认的边界见下文。
 
 ---
 
@@ -111,21 +111,30 @@ dsh plugin add dsh-desktop-bridge  # 2. 桥（本仓库）
 
 ---
 
-## 按 Esc 暂停：轨迹回到原对话
+## 停止操作：轨迹回到原对话
 
-用户只需要按 **Esc**。它暂停的是这一次 GUI 操作，不是保留一个跨消息的可恢复任务。
+按 **Shift+Esc**，由 bridge 自己的原生快捷键 helper 接收，再调用 DSH 的取消接口停止当前 worker。
+**只需要原版 dsh-orb，不修改 orb，不依赖它的悬浮球按钮、私有协议或运行时路径。**球可以关闭。
+快捷键在每次 worker 启动前注册，任务结束或宿主断开后注销。冲突或 helper 启动失败时拒绝开始 GUI 操作并说明原因；
+可配置 `stopShortcut: false`，只使用原对话停止按钮。helper 运行中意外退出会请求停止任务。
+Windows 使用系统热键注册；macOS 包含原生热键实现，但尚需真机验收。**单按 Esc 不是全局 CMU 停止。**
+原版 orb 的球停止按钮只停止球自己的会话，不是 bridge worker 的停止入口。
 
-bridge 会立即取消当前 worker turn、释放桌面租约，然后归档这个一次性 GUI session。暂停前已经发生的工具调用、
-结果、错误、最后一轮 worker 消息和最新截图引用会压成一段有界轨迹，通过 `parent.inject()` 注入回**原来的 Agent
-对话**。这条上下文不会主动唤醒模型；用户下一条自然消息会带着这段轨迹继续。
+bridge 立即关闭该 worker 的工具入口，把取消信号传入已执行的工具，并取消 worker turn。
+收到 `turn/end` 后，还须等待 `tools/execute` 中已进入的调用（包括 finally 收尾）返回，才释放租约并归档。
+`computer_desktop_status` 的 `stopping` 状态表示仍在收尾，不等同“已停止”。不响应取消的调用会继续占有租约。
+快捷键停止不取消父 turn；已有工具调用、结果、错误、最后消息和截图引用会压成有界轨迹作为 `computer_task` 结果返回。
+同一个父 turn 不得再开 GUI worker；下一轮 `turn/start` 才解除限制。若用户停止的是原对话，轨迹改用
+`parent.inject()` 注入，不主动唤醒模型。无需用户管理恢复命令。
 
 | 结果 | 处理 | 下一步 |
 | --- | --- | --- |
-| 用户按 Esc / 停止父 turn | 中断、释放桌面、归档 worker，把 Escape 事件与轨迹注入原对话 | 用户直接说下一句；若还需 GUI，模型新开一个 worker |
+| 用户按 Shift+Esc | 关闭工具入口、中断 worker；等待调用收尾后归档，轨迹作为工具结果返回 | 当前父 turn 禁止重开 CMU |
+| 用户停止父 turn | 同样停止 worker，轨迹注入原对话而不唤醒 | 用户下一条普通消息可使用这些上下文 |
 | 达到 `maxRunSeconds` | 中断、释放桌面、归档 worker，把停止原因与轨迹作为工具结果返回 | 原 Agent 根据轨迹继续或新开 worker |
 | worker 返回 `error` / `max-tokens` / `refusal` 等非完成原因 | 结束、释放桌面、归档 worker，把失败与已有轨迹交回原对话 | 原 Agent 判断是否换结构化路线或重试 |
 | worker 正常完成 | 归档 worker，把完成状态与有界轨迹作为工具结果返回 | 原 Agent 直接答复用户 |
-| 任务还在排队时按 Esc | 直接出队，不创建 worker | 终止 |
+| 排队时停止原对话 | 直接出队，不创建 worker | 终止；悬浮球和快捷键只面向当前运行任务 |
 
 这里没有 `computer_task_resume`。GUI worker 和一次性的 subagent 一样，只服务一次 `computer_task`；完整 worker
 日志和截图附件仍留在归档历史中，但不会把每张图都塞进父会话。下一次 GUI 操作会创建新的 worker，并重新观察
@@ -135,8 +144,11 @@ bridge 会立即取消当前 worker turn、释放桌面租约，然后归档这�
 preset；当前 subagent 的公开一次性请求没有这个选项，所以这里通过 `sessionController.create()` 创建一个只活一次
 的 GUI session。选择 session 只是获得 preset 能力，不改变“一次性、结束后回收”的 subagent 语义。
 
-为了让 Esc 可中断，`computer_task` 会在 worker 运行期间保持当前父 turn 活跃。完成时工具结果进入原 turn；
+`computer_task` 会在 worker 运行期间保持当前父 turn 活跃。完成时工具结果进入原 turn；
 用户中止父 turn 时，工具结果无法可靠落盘，所以暂停路径改用注入，而不是要求用户再说“继续”。
+
+停止请求无法撤回已送进系统的粘贴或其它输入；取消是否能中断动作取决于原版 orb 的取消实现。
+bridge 不提前抛弃执行 Promise，不宣称零延迟中断或回滚，也不以杀掉整个 DSH 进程代替停止 worker。
 
 ---
 
@@ -214,6 +226,7 @@ OS handle 属于进程，但 lease 生命周期属于任务，不是插件加载
 | `maxWaitSeconds` | `300` | 桌面繁忙时最长排队时间 |
 | `maxRunSeconds` | `600` | 单任务最长占用桌面时间 |
 | `maxTasksPerSession` | `1` | 每会话同时在飞的任务数 |
+| `stopShortcut` | `true` | bridge 独立全局 Shift+Esc；关闭后只使用原对话停止按钮 |
 | `workerProvider` / `workerModel` | 继承 | 工作会话模型，**必须支持图片输入** |
 
 ---
@@ -246,7 +259,7 @@ OS handle 属于进程，但 lease 生命周期属于任务，不是插件加载
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-41 项测试：调度 FIFO / 超时 / 取消、任务级跨进程租约、Esc 后一次性 worker 归档与轨迹注入、完成后归档、worker 失败收尾、轨迹长度上界、悬浮球对撞（用宿主实际加载的 dsh-orb 代码判定）、显式标记识别、缺依赖降级。
+测试覆盖：FIFO / 超时 / 取消、任务级跨进程租约、一次性归档与轨迹回传、停止后工具拦截、取消信号传播、等待实际调用收尾、同轮禁止重开、独立快捷键生命周期与注册冲突、显式标记识别及缺依赖降级。
 
 设计取舍与完整验证记录见 [docs/design-notes.md](docs/design-notes.md)。
 

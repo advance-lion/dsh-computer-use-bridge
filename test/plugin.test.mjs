@@ -5,7 +5,10 @@ import test from 'node:test'
 // Keep this process's desktop-control channel namespaced: the real Harness may be
 // holding the production one while the suite runs.
 process.env.DSH_DESKTOP_BRIDGE_CHANNEL = `dsh-desktop-bridge.test.${process.pid}`
-const { apply } = await import('../lib/index.js')
+const { apply: applyPlugin } = await import('../lib/index.js')
+const apply = (ctx, config) => applyPlugin(ctx, config, {
+  startStopShortcut: ctx.startTestShortcut ?? (async () => async () => {}),
+})
 const { desktopControlAddress, releaseDesktopControl } = await import('../lib/control-channel.js')
 const { readWorkerTrace } = await import('../lib/worker-session.js')
 
@@ -83,6 +86,7 @@ function makeContext(options = {}) {
   }
 
   const ctx = {
+    startTestShortcut: options.startStopShortcut,
     tools: {
       register(definition) {
         assert.equal(tools.has(definition.name), false, `duplicate tool ${definition.name}`)
@@ -491,7 +495,7 @@ test('a foreign process conflict is detected per task and does not leave the loc
   }
 })
 
-test('Escape closes the worker and injects its trace into the original conversation', async () => {
+test('stopping the parent closes the worker and injects its trace into the original conversation', async () => {
   reset()
   await releaseDesktopControl()
 
@@ -541,16 +545,17 @@ test('Escape closes the worker and injects its trace into the original conversat
   assert.equal(parent.injected[0].source.form, 'notice')
   assert.equal(parent.injected[0].source.senderSessionId, childId)
   const trace = parent.injected[0].content[0].text
-  assert.match(trace, /user pressed Escape/)
+  assert.match(trace, /user requested a stop/)
   assert.match(trace, /Goal: click Export/)
   assert.match(trace, /screenshot/)
   assert.match(trace, /Calculator shows 56/)
   assert.match(trace, /calculator\.png/)
   assert.match(trace, /closed and is not resumable/)
-  assert.match(trace, /submit a new computer_task/)
+  assert.match(trace, /Do not submit a new computer_task in this turn/)
   assert.equal(sections.has('desktop-bridge-paused'), false)
   assert.equal(tools.has('computer_task_resume'), false)
 
+  handlers.get('session/event')({ header: { id: parent.id } }, { type: 'turn/start' })
   const nextRun = tools.get('computer_task').execute(
     taskArgs({ goal: 'enter the remaining value' }),
     execFor(parent),
@@ -596,6 +601,139 @@ test('normal completion closes and archives the worker while returning its trace
     { sessionId: childId, options: { stopActivity: true } },
   ])
   assert.equal(parent.injected.length, 0, 'the normal tool result already carries the trace')
+  await cleanup()
+})
+
+test('a directly stopped worker returns its trace without cancelling the parent', async () => {
+  reset()
+  await releaseDesktopControl()
+
+  const parent = makeAgent('s1', 'standard')
+  const { ctx, tools, handlers, workerEvents, prompts, archives, cancels } = makeContext({ sessionWorker: true })
+  const cleanup = apply(ctx, {})
+  const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
+  await waitFor(() => prompts.length === 1, 'the worker prompt should be admitted')
+  const childId = prompts[0].sessionId
+  workerEvents.set(childId, workerTraceEvents())
+
+  handlers.get('session/event')(
+    { header: { id: childId } },
+    { type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+  )
+
+  const paused = await running
+  assert.equal(paused.status, 'paused')
+  assert.match(paused.result, /user requested a stop/)
+  assert.deepEqual(archives, [
+    { sessionId: childId, options: { stopActivity: true } },
+  ])
+  assert.deepEqual(cancels, [])
+  assert.equal(parent.injected.length, 0, 'the active tool result carries the trace')
+  await cleanup()
+})
+
+test('bridge shortcut cancels only worker and waits for actual tool cleanup after turn/end', async () => {
+  reset()
+  await releaseDesktopControl()
+  const parent = makeAgent('caller', 'standard')
+  let attached
+  let detached = 0
+  const inputIdle = Promise.withResolvers()
+  const startStopShortcut = async (stop) => {
+    attached = stop
+    return async () => { detached += 1 }
+  }
+  const { ctx, tools, handlers, prompts, cancels, archives } = makeContext({ sessionWorker: true, startStopShortcut })
+  const cleanup = apply(ctx, {})
+  const running = tools.get('computer_task').execute(taskArgs(), execFor(parent))
+  await waitFor(() => prompts.length === 1, 'worker should start')
+  const childId = prompts[0].sessionId
+  const actionSignal = new AbortController().signal
+  const execution = { agent: { id: childId }, signal: actionSignal }
+  let deliveredSignal
+  const action = handlers.get('tools/execute')(execution, async () => {
+    deliveredSignal = execution.signal
+    await inputIdle.promise
+  })
+  const stopping = attached()
+  await stopping
+  assert.equal(deliveredSignal.aborted, true)
+  assert.deepEqual(cancels, [{ sessionId: childId }])
+  assert.equal(detached, 0, 'cancel acceptance must not release the stop target')
+  assert.equal(globalThis[OWNER_KEY].ownerId, childId)
+  assert.equal(globalThis[SCHEDULER_KEY].busy, true)
+  assert.deepEqual(await handlers.get('tools/pre-execute')(execution, async () => ({ kind: 'allow' })), { kind: 'cancel' })
+  assert.equal(archives.length, 0)
+  handlers.get('session/event')(
+    { header: { id: childId } },
+    { type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(detached, 0, 'a worker turn can end while a native input is still draining')
+  assert.equal(globalThis[SCHEDULER_KEY].busy, true)
+  inputIdle.resolve()
+  await action
+  const result = await running
+  await stopping
+  assert.equal(result.status, 'paused')
+  assert.equal(detached, 1)
+  assert.equal(parent.injected.length, 0)
+  assert.equal(parent.notices.length, 0)
+  assert.equal(archives.length, 1)
+  assert.equal(globalThis[SCHEDULER_KEY].busy, false)
+  await assert.rejects(tools.get('computer_task').execute(taskArgs(), execFor(parent)), /user stopped Computer Use/)
+  await assert.rejects(handlers.get('tools/execute')(execution, async () => {}), /no further worker tools/)
+  assert.equal(execution.signal, actionSignal)
+  await cleanup()
+})
+
+test('shortcut startup failure refuses GUI admission and releases both leases', async () => {
+  reset()
+  await releaseDesktopControl()
+  const { ctx, tools, prompts, archives } = makeContext({
+    sessionWorker: true,
+    startStopShortcut: async () => { throw new Error('hotkey conflict') },
+  })
+  const cleanup = apply(ctx, {})
+  await assert.rejects(tools.get('computer_task').execute(taskArgs(), execFor(makeAgent('caller', 'standard'))), /hotkey conflict/)
+  assert.equal(prompts.length, 0)
+  assert.equal(archives.length, 1)
+  assert.equal(globalThis[SCHEDULER_KEY].busy, false)
+  assert.equal(globalThis[CONTROL_KEY]?.attempt, undefined)
+  await cleanup()
+})
+
+test('stopShortcut false starts with original-chat Stop only', async () => {
+  reset()
+  await releaseDesktopControl()
+  const { ctx, tools, handlers, prompts } = makeContext({
+    sessionWorker: true,
+    startStopShortcut: async () => assert.fail('shortcut explicitly disabled'),
+  })
+  const cleanup = apply(ctx, { stopShortcut: false })
+  const running = tools.get('computer_task').execute(taskArgs(), execFor(makeAgent('caller', 'standard')))
+  await waitFor(() => prompts.length === 1, 'worker should start')
+  handlers.get('session/event')({ id: prompts[0].sessionId }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  assert.equal((await running).status, 'completed')
+  await cleanup()
+})
+
+test('a stop during shortcut startup never admits the initial worker prompt', async () => {
+  reset()
+  await releaseDesktopControl()
+  let disposed = false
+  const { ctx, tools, prompts } = makeContext({
+    sessionWorker: true,
+    startStopShortcut: async (stop) => {
+      await stop()
+      return async () => { disposed = true }
+    },
+  })
+  const cleanup = apply(ctx, {})
+  const result = await tools.get('computer_task').execute(taskArgs(), execFor(makeAgent('caller', 'standard')))
+  assert.equal(result.status, 'paused')
+  assert.equal(prompts.length, 0)
+  assert.equal(disposed, true)
   await cleanup()
 })
 

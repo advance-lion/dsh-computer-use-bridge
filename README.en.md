@@ -47,13 +47,13 @@ your session ──computer_task──▶ desktop worker ──▶ screenshot / 
 | Explicit `@Computer` invocation | ✅ | ✅ `@computer` / `@desktop` |
 | Structured integrations first (plugin / MCP) | ✅ | ✅ built into the tool criteria |
 | One executor on the desktop | platform-level | ✅ task lease + cross-process claim |
-| Stops when you stop | ✅ | ✅ Escape stops and closes the worker, returning its trace to the original chat |
+| Stops when you stop | ✅ | ✅ Bridge-owned Shift+Esc or original chat Stop, returning the trace |
 | Per-task budget cap | ✅ | ✅ time-and-queue limits, configurable |
 | Independent cursor, background operation | macOS background; Windows foreground-only | macOS (dsh-orb background); Windows (dsh-orb foreground-only) |
 | Per-action human confirmation | ✅ | ⚠️ partial: budget and stop, no per-click prompt yet |
 
 > In short: **the execution surface is on par with Codex; the scheduling and safety model is rebuilt for how DSH actually runs.**
-> The two gaps are listed under Boundaries rather than hidden.
+> Platform behavior and per-action confirmation limits are listed under Boundaries.
 
 ---
 
@@ -111,23 +111,31 @@ The still frame below is the verified end state:
 
 ---
 
-## Escape pauses: the trace returns to the original chat
+## Stopping: the trace returns to the original chat
 
-The user has one control: press **Escape**. It pauses the current GUI operation; it does not preserve a
-cross-message task that can be resumed later.
+Use **Shift+Esc**, registered by bridge's own native helper, or the original chat Stop button.
+Stock orb is sufficient. No orb modifications, private protocol, floating ball, or orb runtime path is required.
+The shortcut is enabled by default for each task and removed on release or disconnect. Startup/conflict
+failures prevent GUI work from starting; `stopShortcut: false` opts into original-chat Stop only.
+Unexpected helper exit stops the task. Windows is verified; the macOS native path still needs device acceptance.
+Bare Escape and the stock orb ball Stop button are not bridge-wide stop controls.
 
-The bridge cancels the active worker turn, releases the desktop lease, and archives the one-shot GUI session.
+Bridge closes the worker's tool gate, aborts the signal delivered to active tools, and cancels the worker.
+After worker `turn/end`, it also waits for entered tool promises and cleanup before releasing the lease.
+Desktop status reports `stopping` while cleanup is pending. The shortcut leaves the caller alive so the
+trace returns as the tool result, and prevents that caller from restarting GUI work in the same turn.
 The tool calls, results, errors, latest worker message, and latest screenshot references from before the pause
-are reduced to a bounded trace and injected into the **original Agent conversation** through `parent.inject()`.
-That context does not wake the model by itself; the user's next ordinary message continues with the trace.
+are reduced to a bounded trace. If the parent turn itself was stopped, the trace is instead injected through
+`parent.inject()` without waking the model. The user does not need to manage a resume command.
 
 | Outcome | Action | Next step |
 | --- | --- | --- |
-| User presses Escape / parent turn stops | Interrupt, release the desktop, archive the worker, inject the Escape event and trace | The user just sends the next message; if GUI work is still needed, the model starts a fresh worker |
+| Shift+Esc | Block new worker calls, abort active calls, wait for settlement, archive and return the trace | No more CMU in this parent turn |
+| Parent turn stops | Stop worker, wait for cleanup, archive and inject trace without waking | The next ordinary user message has the trace |
 | `maxRunSeconds` is reached | Interrupt, release, archive, and return the stop reason plus trace as the tool result | The original Agent continues from the evidence or starts a fresh worker |
 | Worker ends with `error`, `max-tokens`, `refusal`, or another non-complete reason | Close and archive it, returning the failure and available trace | The original Agent chooses another route or retries |
 | Worker completes normally | Archive it and return the completion status plus bounded trace as the tool result | The original Agent answers the user |
-| User presses Escape while the task is queued | Remove it from the queue without creating a worker | Terminated |
+| Parent chat stops while queued | Remove it without creating a worker | Terminated; ball and shortcut target the running task only |
 
 There is no `computer_task_resume`. Like a one-shot subagent, a GUI worker serves exactly one `computer_task`.
 The complete worker log and image attachments remain in archived history, but every screenshot is not copied
@@ -139,9 +147,13 @@ Current DSH still provides one-shot `ctx.subagents.start()`, but bridge also has
 `sessionController.create()` to create a GUI session that lives for one invocation. Session is the mechanism
 that exposes the preset; it does not change the one-shot, dispose-after-use subagent lifecycle.
 
-So Escape can interrupt it, `computer_task` keeps the current parent turn active while the worker runs. A
+`computer_task` keeps the current parent turn active while the worker runs. A
 normal completion returns through the tool result. When the user aborts the parent turn, that result cannot
 be delivered reliably, so the pause path injects the trace instead of asking the user to say “continue”.
+
+Stopping cannot undo input already delivered to the OS. Current-action cancellation depends on stock orb.
+Bridge does not abandon execution promises, release a still-busy desktop, or kill the DSH host to stop a worker.
+Zero-latency interruption and rollback are not guaranteed.
 
 ---
 
@@ -220,6 +232,7 @@ load until process exit.
 | `maxWaitSeconds` | `300` | Longest queue wait while the desktop is busy |
 | `maxRunSeconds` | `600` | Longest time one task may hold the desktop |
 | `maxTasksPerSession` | `1` | Concurrent in-flight tasks per session |
+| `stopShortcut` | `true` | Bridge-owned global Shift+Esc; false uses original-chat Stop only |
 | `workerProvider` / `workerModel` | inherited | Worker model, **must accept image input** |
 
 ---
@@ -252,7 +265,7 @@ If the preset is renamed or missing, the plugin says so in a startup self-check 
 node --test --test-concurrency=1 "test/*.test.mjs"
 ```
 
-41 tests: FIFO / timeout / cancellation, task-scoped cross-process leases, one-shot archive and trace injection after Escape, archive on completion, worker-failure cleanup, trace-size bounding, floating-ball collision (judged by the dsh-orb build the host actually loads), explicit-marker parsing, and degraded mode without the dependency.
+Tests cover scheduling, task leases, one-shot trace handoff, tool cancellation and quiescence, same-turn restart prevention, independent shortcut lifecycle/conflicts, marker parsing, and missing-dependency behavior.
 
 Design rationale and the full verification record: [docs/design-notes.md](docs/design-notes.md).
 

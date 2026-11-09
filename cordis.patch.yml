@@ -13,3 +13,5 @@
         maxWaitSeconds: 300
         maxRunSeconds: 600
         maxTasksPerSession: 1
+        # Bridge-owned global Shift+Esc. false = original chat Stop only.
+        stopShortcut: true
